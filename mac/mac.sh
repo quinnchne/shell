@@ -11,8 +11,13 @@ mac_battery() {
     ioreg -rn AppleSmartBattery | grep -i "MaxCapacity\|Designcapacity"
 }
 
-delete_finder_recent() {
+clear_finder_recent() {
     defaults delete com.apple.finder FXRecentFolders
+}
+
+clear_finder_cmd_shift_g_recent() {
+    defaults delete com.apple.finder GoToField
+    defaults delete com.apple.finder GoToFieldHistory
 }
 
 clear_dir() {
