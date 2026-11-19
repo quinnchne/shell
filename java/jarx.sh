@@ -321,11 +321,16 @@ _start_project_jars_in_cwd() {
 # 复用正在运行的 java 进程的完整启动命令（/proc/<pid>/cmdline）和工作目录来重启，
 # 这样重启时不需要再传 PORT、Nacos 等启动参数，也不会漏写 -cloud 对应的 -D 选项
 # 注意：只复用命令行和工作目录，不复用原进程的环境变量
+# 用法: _restart_jar_srv <JAR> [<rm|bk|rb> [<ROOT_DIR> [<yyyy-mm-dd>]]]
+#   ROOT_DIR 省略时从原进程使用的 jar 路径 (<ROOT_DIR>/jar/<JAR>) 反推
+#   给了 rm|bk 时，流程是：读取启动命令 -> 检查 -> 停进程 -> 替换 jar -> 启动
+#   启动命令在停进程之前已经读到变量里，所以停进程之后再替换 jar 也不影响复用
 _restart_jar_srv() {
     if [ -z "$1" ]; then
-        echo 'Usage: _restart_jar_srv <JAR>'
+        echo 'Usage: _restart_jar_srv <JAR> [<rm|bk|rb> [<ROOT_DIR> [<yyyy-mm-dd>]]]'
         return 1
     fi
+    local swap_mode="$2" swap_root="$3" swap_date="$4"
 
     local pid arg prev has_jar jar_arg cwd target_pid target_jar
     local found=0
@@ -380,12 +385,43 @@ _restart_jar_srv() {
         return 1
     fi
 
+    # 替换模式：原进程实际使用的 jar 必须就是 <ROOT_DIR>/jar/<JAR>，
+    # 否则换了 jar 重启后用的还是别处的旧 jar
+    # 没传 ROOT_DIR 时，从原进程使用的 jar 路径反推：<ROOT_DIR>/jar/<JAR> -> <ROOT_DIR>
+    if [ -n "$swap_mode" ]; then
+        local used_jar expect_jar jar_dir
+        used_jar="$(cd "$cwd" && realpath -m -- "$target_jar")"
+        if [ -z "$swap_root" ]; then
+            jar_dir="$(dirname -- "$used_jar")"
+            if [ "$(basename -- "$jar_dir")" != "jar" ]; then
+                echo "[$1] 无法推断 ROOT_DIR ❌ : 原进程使用的 jar 不是 <ROOT_DIR>/jar/<JAR> 形式 ($used_jar)，请用 -root 指定，未停止原进程"
+                return 1
+            fi
+            swap_root="$(dirname -- "$jar_dir")"
+            echo "[$1] ROOT_DIR inferred from running process: $swap_root"
+        else
+            expect_jar="$(realpath -m -- "$swap_root/jar/$(basename -- "$1")")"
+            if [ "$used_jar" != "$expect_jar" ]; then
+                echo "[$1] 原进程使用的 jar 不是 $expect_jar ❌ : $used_jar，未停止原进程"
+                return 1
+            fi
+        fi
+        _swap_jar_check "$swap_root" "$(basename -- "$1")" "$swap_mode" "$swap_date" || return 1
+    fi
+
     echo "[$1] restart with:"
     echo "  cwd: $cwd"
     echo "  cmd: ${cmd[*]}"
 
     # 必须在 stop 之前读取（stop 之后 /proc/<pid> 就没了）
     _stop_jar_srv "$1" || return 1
+
+    if [ -n "$swap_mode" ]; then
+        _swap_jar "$swap_mode" "$swap_root" "$(basename -- "$1")" "$swap_date" || {
+            echo "[$1] 替换 jar 失败 ❌ , 原进程已停止，未启动"
+            return 1
+        }
+    fi
 
     # 仅在本函数及其子进程内生效，避免污染调用者（交互式）shell 的环境
     local -x LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
@@ -484,6 +520,154 @@ _wait_ports() {
     done
 }
 
+# 回滚时找备份：输出备份文件路径 <ROOT_DIR>/jar/bk/<yyyy-mm-dd>/<JAR>
+# 用法: _rb_find_bk <ROOT_DIR(绝对路径)> <JAR> [yyyy-mm-dd]
+#   给了日期：只找该日期目录；没给：取最近一个含该 jar 的日期目录
+_rb_find_bk() {
+    local root="$1" jar="$2" d="$3" found
+    if [ -n "$d" ]; then
+        found="$root/jar/bk/$d/$jar"
+        if [ ! -f "$found" ]; then
+            echo "[$jar] backup not found ❌ : $found" >&2
+            return 1
+        fi
+    else
+        found="$(find "$root/jar/bk" -mindepth 2 -maxdepth 2 -type f -name "$jar" \
+            -path '*/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/*' 2>/dev/null | sort -r | head -n 1)"
+        if [ -z "$found" ]; then
+            echo "[$jar] no backup found ❌ : $root/jar/bk/<yyyy-mm-dd>/$jar" >&2
+            return 1
+        fi
+    fi
+    echo "$found"
+}
+
+# 替换 jar 前的检查（不改动任何文件），在停止原进程之前调用，失败就不要停进程
+# 用法: _swap_jar_check <ROOT_DIR> <JAR文件名> [rm|bk|rb] [yyyy-mm-dd]
+_swap_jar_check() {
+    if [ $# -lt 2 ] || [ -z "$1" ] || [ -z "$2" ]; then
+        echo 'Usage: _swap_jar_check <ROOT_DIR> <JAR> [rm|bk|rb] [yyyy-mm-dd]'
+        return 1
+    fi
+
+    local root
+    root="$(cd -- "$1" 2>/dev/null && pwd)" || {
+        echo "jarx: ROOT_DIR not found: $1"
+        return 1
+    }
+
+    case "$2" in
+    */*)
+        echo "jarx: -rm/-bk/-rb 的 <JAR> 只能是文件名，不能带路径: $2"
+        return 1
+        ;;
+    esac
+
+    if [ "$3" = "rb" ]; then
+        # 回滚：备份必须存在；jar/new 下不能已有同名 jar，否则会把还没部署的新 jar 覆盖掉
+        _rb_find_bk "$root" "$2" "$4" >/dev/null || { echo "未停止原进程"; return 1; }
+        if [ -e "$root/jar/new/$2" ]; then
+            echo "[$2] $root/jar/new/$2 已存在 ❌ , 回滚会把它覆盖，请先处理掉，未停止原进程"
+            return 1
+        fi
+        mkdir -p -- "$root/jar/new" 2>/dev/null || {
+            echo "jarx: 无法创建 $root/jar/new ❌ , 未停止原进程"
+            return 1
+        }
+    elif [ ! -f "$root/jar/new/$2" ]; then
+        echo "[$2] new jar not found ❌ : $root/jar/new/$2，未停止原进程"
+        return 1
+    fi
+
+    # 停进程之后再发现目录不可写就晚了
+    mkdir -p -- "$root/jar/bk" 2>/dev/null && [ -w "$root/jar" ] || {
+        echo "jarx: $root/jar 不可写 ❌ , 未停止原进程"
+        return 1
+    }
+}
+
+# 替换 jar：把 <ROOT_DIR>/jar/new/<JAR>（新 jar）换到 <ROOT_DIR>/jar/<JAR>，老 jar 按模式处理
+# 应在停止原进程之后调用（jar 不再被占用）
+# 用法: _swap_jar <rm|bk|rb> <ROOT_DIR> <JAR文件名> [yyyy-mm-dd]
+#   rb  回滚（与 bk 相反）：把当前 jar 放回 <ROOT_DIR>/jar/new/<JAR>，
+#       再把 <ROOT_DIR>/jar/bk/<yyyy-mm-dd>/<JAR> 移回 <ROOT_DIR>/jar/<JAR>；日期省略时取最近一次备份
+#   rm  删除老 jar：
+#       rm -f <ROOT_DIR>/jar/<JAR> && mv <ROOT_DIR>/jar/new/<JAR> <ROOT_DIR>/jar/<JAR>
+#   bk  备份老 jar 到 <ROOT_DIR>/jar/bk/<yyyy-mm-dd>/ (目录不存在则新建)：
+#       mv <ROOT_DIR>/jar/<JAR> <ROOT_DIR>/jar/bk/<yyyy-mm-dd>/ && mv <ROOT_DIR>/jar/new/<JAR> <ROOT_DIR>/jar/<JAR>
+# 先确认新 jar 存在再动老 jar，避免新 jar 没传上来时把老 jar 删掉；
+# 老 jar 不存在（首次部署）时跳过删除/备份，直接放入新 jar
+_swap_jar() {
+    if [ $# -lt 3 ] || [ -z "$2" ] || [ -z "$3" ]; then
+        echo 'Usage: _swap_jar <rm|bk|rb> <ROOT_DIR> <JAR> [yyyy-mm-dd]'
+        return 1
+    fi
+
+    local mode="$1" jar="$3" bk_date="$4" root
+    root="$(cd -- "$2" 2>/dev/null && pwd)" || {
+        echo "jarx: ROOT_DIR not found: $2"
+        return 1
+    }
+
+    case "$jar" in
+    */*)
+        echo "jarx: -rm/-bk/-rb 的 <JAR> 只能是文件名，不能带路径: $jar"
+        return 1
+        ;;
+    esac
+
+    local new_jar="$root/jar/new/$jar"
+    local old_jar="$root/jar/$jar"
+
+    if [ "$mode" = "rb" ]; then
+        local src
+        src="$(_rb_find_bk "$root" "$jar" "$bk_date")" || return 1
+        if [ -e "$new_jar" ]; then
+            echo "[$jar] $new_jar 已存在 ❌ , 未做任何改动"
+            return 1
+        fi
+        mkdir -p -- "$root/jar/new" || return 1
+
+        if [ -e "$old_jar" ]; then
+            mv -f -- "$old_jar" "$new_jar" || return 1
+            echo "[$jar] current jar moved back: $new_jar"
+        else
+            echo "[$jar] current jar not exist, skip: $old_jar"
+        fi
+        # 第二步失败时把第一步还原，避免 jar/<JAR> 处于缺失状态
+        mv -f -- "$src" "$old_jar" || {
+            [ -e "$new_jar" ] && mv -f -- "$new_jar" "$old_jar"
+            return 1
+        }
+        echo "[$jar] rolled back: $src -> $old_jar"
+        rmdir -- "$(dirname -- "$src")" 2>/dev/null   # 日期目录空了就顺手删掉
+        return 0
+    fi
+
+    if [ ! -f "$new_jar" ]; then
+        echo "[$jar] new jar not found ❌ : $new_jar，未做任何改动"
+        return 1
+    fi
+
+    mkdir -p -- "$root/jar" || return 1
+
+    if [ -e "$old_jar" ]; then
+        if [ "$mode" = "rm" ]; then
+            rm -f -- "$old_jar" || return 1
+            echo "[$jar] old jar removed: $old_jar"
+        else
+            local bk_dir="$root/jar/bk/$(date +%F)"
+            mkdir -p -- "$bk_dir" && mv -f -- "$old_jar" "$bk_dir/" || return 1
+            echo "[$jar] old jar backed up: $bk_dir/$jar"
+        fi
+    else
+        echo "[$jar] old jar not exist, skip: $old_jar"
+    fi
+
+    mv -f -- "$new_jar" "$old_jar" || return 1
+    echo "[$jar] new jar in place: $old_jar"
+}
+
 _jarx_usage() {
     cat <<'USAGE'
 Usage:
@@ -496,6 +680,16 @@ Usage:
   jarx stop    <JAR>...                      停止 jar (可同时给多个)
   jarx restart <JAR>                         重启：复用正在运行进程的完整启动命令，不用再加参数选项
   jarx restart [-cloud] <JAR> <参数...>      重启：如果参数选项有变，可以再显式给定参数重启 (参数同 start, 不支持 -fg)
+  jarx restart [-cloud] (-rm | -bk) [-root <ROOT_DIR>] <JAR> [参数...]
+                                             重启 (停进程 -> 替换 jar -> 启动)：把 <ROOT_DIR>/jar/new/<JAR> (新 jar) 换到 <ROOT_DIR>/jar/<JAR>，
+                                             -rm 删除老 jar，-bk 把老 jar 备份到 <ROOT_DIR>/jar/bk/<yyyy-mm-dd>/ ；
+                                             <JAR> 只能是文件名；只给 <JAR> 时同样复用运行中进程的启动命令，
+                                             且可省略 -root (从运行中进程的 jar 路径 <ROOT_DIR>/jar/<JAR> 反推)；
+                                             显式给启动参数时必须带 -root
+  jarx restart [-cloud] -rb [-date <yyyy-mm-dd>] [-root <ROOT_DIR>] <JAR> [参数...]
+                                             回滚 (停进程 -> 换回备份 -> 启动)：把当前 <ROOT_DIR>/jar/<JAR> 放回 <ROOT_DIR>/jar/new/，
+                                             再把 <ROOT_DIR>/jar/bk/<yyyy-mm-dd>/<JAR> 移回 <ROOT_DIR>/jar/；
+                                             -date 省略时取最近一次备份；-root 的规则同 -rm/-bk
   jarx pids    <JAR>                         查看 jar 的 PID
   jarx wait-port [-t SECONDS] <HOST:PORT | http://HOST[:PORT]/PATH>...
                                              等待一个或多个端点就绪 (默认超时 120 秒)：
@@ -506,6 +700,13 @@ Options:
   -cloud   使用 cloud jar 包的启动参数
   -fg      前台启动 (不使用 nohup / &，输出到终端)，适合 systemd 托管
   -root    项目父级目录 <ROOT_DIR>，jar / Nacos / Sentinel 的目录均按下面的"目录约定"推导
+           (restart 时仅配合 -rm / -bk 使用，只给 <JAR> 时可省略)
+  -rm      restart 前删除老 jar (<ROOT_DIR>/jar/<JAR>)，再放入新 jar (<ROOT_DIR>/jar/new/<JAR>)
+  -rb      restart 前回滚：当前 jar 放回 <ROOT_DIR>/jar/new/<JAR>，备份 jar 移回 <ROOT_DIR>/jar/<JAR>
+           (<ROOT_DIR>/jar/new/ 下已有同名 jar 时拒绝执行，避免覆盖尚未部署的新 jar)
+  -date    与 -rb 配合，指定从哪个备份日期目录回滚 (yyyy-mm-dd)，省略时取最近一次
+  -bk      restart 前备份老 jar 到 <ROOT_DIR>/jar/bk/<yyyy-mm-dd>/ (目录不存在则新建)，再放入新 jar
+           同一天内多次备份同名 jar，后一次会覆盖前一次
   -ns      Nacos 配置命名空间和服务命名空间 (两者取同一个值)
 
 目录约定 (jarx start -cloud -root ... 批量启动时)：
@@ -538,11 +739,33 @@ jarx() {
 
     case "$cmd" in
     start|restart)
-        local cloud=0 fg=0 root="" ns=""
+        local cloud=0 fg=0 root="" ns="" swap="" bk_date=""
         while [ $# -gt 0 ]; do
             case "$1" in
             -cloud) cloud=1; shift ;;
             -fg)    fg=1;    shift ;;
+            -rm|-bk|-rb)
+                if [ -n "$swap" ] && [ "$swap" != "${1#-}" ]; then
+                    echo "jarx: -rm, -bk and -rb are mutually exclusive"
+                    return 1
+                fi
+                swap="${1#-}"
+                shift
+                ;;
+            -date)
+                if [ $# -lt 2 ]; then
+                    echo "jarx: option -date requires a value"
+                    return 1
+                fi
+                case "$2" in
+                [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) bk_date="$2" ;;
+                *)
+                    echo "jarx: -date 格式应为 yyyy-mm-dd (例如 2026-11-17): $2"
+                    return 1
+                    ;;
+                esac
+                shift 2
+                ;;
             -root|-ns)
                 if [ $# -lt 2 ]; then
                     echo "jarx: option $1 requires a value"
@@ -558,10 +781,26 @@ jarx() {
         local fg_opt=""
         [ $fg -eq 1 ] && fg_opt="-fg"
 
+        if [ -n "$bk_date" ] && [ "$swap" != "rb" ]; then
+            echo "jarx: -date 只能和 -rb 一起使用"
+            return 1
+        fi
+
+        if [ -n "$swap" ]; then
+            if [ "$cmd" != "restart" ]; then
+                echo "jarx: -rm/-bk/-rb only apply to restart"
+                return 1
+            fi
+            if [ -n "$ns" ]; then
+                echo "jarx: restart does not support -ns"
+                return 1
+            fi
+        fi
+
         # 批量模式：-root / -ns + 一个或多个 jar 文件名
-        if [ -n "$root" ] || [ -n "$ns" ]; then
+        if [ -z "$swap" ] && { [ -n "$root" ] || [ -n "$ns" ]; }; then
             if [ "$cmd" != "start" ]; then
-                echo "jarx: $cmd does not support -root/-ns"
+                echo "jarx: $cmd does not support -root/-ns (restart 前替换/回滚 jar 请用 -rm/-bk/-rb)"
                 return 1
             fi
             if [ $cloud -ne 1 ]; then
@@ -581,20 +820,46 @@ jarx() {
                 _jarx_usage
                 return 1
             fi
+            # -rm/-bk：先做检查（此时不改动任何东西），真正的替换在停进程之后进行
+            # 没传 -root 时 ROOT_DIR 要等读到运行中进程的 jar 路径后才能推断，检查推迟到 _restart_jar_srv 里
+            if [ -n "$swap" ] && [ -n "$root" ]; then
+                _swap_jar_check "$root" "$1" "$swap" "$bk_date" || return 1
+            fi
+
             # 只给了 JAR：复用正在运行进程的完整启动命令（此时 -cloud 可省略）
             if [ $# -eq 1 ]; then
-                _restart_jar_srv "$1"
+                _restart_jar_srv "$1" "$swap" "$root" "$bk_date"
                 return $?
             fi
 
-            # 给了完整参数：按参数重启。先确认 jar 存在，路径写错时不要把正在运行的服务停掉
-            if [ ! -f "$1" ]; then
+            local jar_name="$1"
+            if [ -n "$swap" ] && [ -z "$root" ]; then
+                echo "jarx: 显式传启动参数时，-rm/-bk/-rb 需要用 -root <ROOT_DIR> 指定目录（只给 <JAR> 时可省略）"
+                return 1
+            fi
+            if [ -n "$swap" ]; then
+                # 显式给参数时按换好后的 <ROOT_DIR>/jar/<JAR> 启动（此时它可能还是老 jar 或还不存在）
+                set -- "$(cd -- "$root" && pwd)/jar/$1" "${@:2}"
+            elif [ ! -f "$1" ]; then
+                # 给了完整参数：按参数重启。先确认 jar 存在，路径写错时不要把正在运行的服务停掉
                 echo "[$1] jar not found ❌ , 未停止原进程"
                 return 1
             fi
 
             # 未启动时 stop 会返回 1，这里不中断，继续启动
             _stop_jar_srv "$1"
+
+            if [ -n "$swap" ]; then
+                # stop 返回 1 既可能是"没在运行"也可能是"停止超时"，进程仍在时不能动 jar
+                if _is_jar_pid_exists "$jar_name"; then
+                    echo "[$jar_name] 原进程仍在运行 ❌ , 未替换 jar"
+                    return 1
+                fi
+                _swap_jar "$swap" "$root" "$jar_name" "$bk_date" || {
+                    echo "[$jar_name] 替换 jar 失败 ❌ , 原进程已停止，未启动"
+                    return 1
+                }
+            fi
         fi
 
         if [ $cloud -eq 1 ]; then
