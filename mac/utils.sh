@@ -20,8 +20,13 @@ len() {
 }
 
 lessx() {
-    # find $2 -name $1 | xargs less
-    find $2 -name $1 -exec less {} +
+    # 逐个用 less 打开文件，查看完后输出该文件的完整路径
+    find "$2" -name "$1" -exec sh -c '
+        for file do
+            less "$file"
+            printf "%s\n" "$(cd "$(dirname "$file")" && pwd -P)/$(basename "$file")"
+        done
+    ' sh {} +
 }
 
 grepx() {
